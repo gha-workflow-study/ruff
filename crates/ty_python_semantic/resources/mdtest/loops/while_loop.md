@@ -125,5 +125,5 @@ class NotBoolable:
 
 # error: [unsupported-bool-conversion] "Boolean conversion is not supported for type `NotBoolable`"
 while NotBoolable():
-    ...
+    pass
 ```
