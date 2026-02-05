@@ -120,6 +120,51 @@ impl ProjectDatabase {
                                 }
                             }
                         }
+
+                        // Some LSP clients will send a `change` event
+                        // for a file without a `created` event. So we
+                        // try to detect that case here.
+                        //
+                        // Concretely, this seems to happen with
+                        // neovim[1]. Specifically, this can occur when
+                        // one opens a buffer for a new Python file
+                        // that isn't actually saved to disk yet. Then
+                        // once it's saved, neovim sends a CHANGE event
+                        // and not a CREATED event. Historically, this
+                        // meant that we wouldn't re-scan for files
+                        // and thus wouldn't add the newly saved file
+                        // to the project. This change here tries to
+                        // detect that case and force re-scanning of
+                        // the directory. We want this to be narrow to
+                        // avoid spurious re-scanning though.
+                        //
+                        // This case is only relevant in "workspace"
+                        // diagnostic mode and when files that aren't
+                        // on disk yet are still transmitted from the
+                        // LSP client using a `file` scheme. When a
+                        // different scheme is used, our LSP detects it
+                        // as a virtual file and handles the case
+                        // correctly by explicitly checking the open file
+                        // set.
+                        //
+                        // Arguably there is a better way to work around
+                        // this issue, but it's not clear what it is. ---AG
+                        //
+                        // Ref: <https://github.com/astral-sh/ruff/issues/15392>
+                        // Ref: <https://github.com/neovim/neovim/issues/21276>
+                        // Ref: <https://github.com/microsoft/language-server-protocol/issues/1030>
+                        //
+                        // [1]: https://github.com/astral-sh/ty/issues/2616
+                        if self.system().is_file(&path)
+                            && project.is_file_included(self, &path)
+                            && let Some(file) = self.files().try_system(self, &path)
+                            && !project.files(self).contains(&file)
+                        {
+                            // Add the parent directory because `walkdir`
+                            // always visits explicitly passed files even if
+                            // they match an exclude filter.
+                            added_paths.insert(path.parent().unwrap().to_path_buf());
+                        }
                     }
                 }
 
@@ -147,8 +192,9 @@ impl ProjectDatabase {
 
                     if self.system().is_file(&path) {
                         if project.is_file_included(self, &path) {
-                            // Add the parent directory because `walkdir` always visits explicitly passed files
-                            // even if they match an exclude filter.
+                            // Add the parent directory because `walkdir`
+                            // always visits explicitly passed files even if
+                            // they match an exclude filter.
                             added_paths.insert(path.parent().unwrap().to_path_buf());
                         }
                     } else if project.is_directory_included(self, &path) {

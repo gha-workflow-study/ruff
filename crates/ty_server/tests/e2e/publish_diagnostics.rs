@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use lsp_types::{
-    DidOpenTextDocumentParams, FileChangeType, FileEvent, TextDocumentItem,
+    DidOpenTextDocumentParams, FileChangeType, FileEvent, TextDocumentItem, Url,
     notification::{DidOpenTextDocument, PublishDiagnostics},
 };
 use ruff_db::system::SystemPath;
@@ -29,6 +29,136 @@ def foo() -> str:
     server.open_text_document(foo, foo_content, 1);
     let diagnostics = server.await_notification::<PublishDiagnostics>();
 
+    insta::assert_debug_snapshot!(diagnostics);
+
+    Ok(())
+}
+
+/// Tests that we get diagnostics for a file that is NOT saved to
+/// disk when using `OpenFilesOnly` diagnostic mode.
+#[test]
+fn on_did_open_non_existing_file_open_files_only() -> Result<()> {
+    let workspace_root = SystemPath::new("src");
+    let foo = SystemPath::new("src/foo.py");
+    let foo_content = "\
+def foo() -> str:
+    return 42
+";
+
+    let mut server = TestServerBuilder::new()?
+        .with_workspace(
+            workspace_root,
+            Some(
+                ClientOptions::default()
+                    .with_diagnostic_mode(ty_server::DiagnosticMode::OpenFilesOnly),
+            ),
+        )?
+        .enable_pull_diagnostics(false)
+        .build()
+        .wait_until_workspaces_are_initialized();
+
+    server.open_text_document(foo, foo_content, 1);
+    let diagnostics = server.await_notification::<PublishDiagnostics>();
+    insta::assert_debug_snapshot!(diagnostics);
+
+    Ok(())
+}
+
+/// Tests that we get diagnostics, eventually, for a file that is NOT saved to
+/// disk when using `Workspace` diagnostic mode, but sadly, only after the file
+/// is saved to disk.
+///
+/// Basically, ty currently doesn't know whether a `file://...` path refers
+/// to a file that doesn't exist or not. To work around that, there's some
+/// logic in our directory scanning that tries to add newly created files
+/// for which we get a CHANGE event for. But in order for that work-around
+/// to apply, the directory re-scanning needs to actually run. We can force
+/// that to happen by sending a CHANGE event after saving the file.
+///
+/// This test somewhat serves as documentation of a bug in ty. But it also
+/// represents an improvement in the status quo, where sending a CHANGE event
+/// wouldn't cause the directory scanning to pick up the new file.
+#[test]
+fn on_did_open_non_existing_file_workspace_with_file_uri() -> Result<()> {
+    let workspace_root = SystemPath::new("src");
+    let foo = SystemPath::new("src/foo.py");
+    let foo_content = "\
+def foo() -> str:
+    return 42
+";
+
+    let mut server = TestServerBuilder::new()?
+        .with_workspace(
+            workspace_root,
+            Some(
+                ClientOptions::default().with_diagnostic_mode(ty_server::DiagnosticMode::Workspace),
+            ),
+        )?
+        .enable_pull_diagnostics(false)
+        .build()
+        .wait_until_workspaces_are_initialized();
+
+    server.open_text_document(foo, foo_content, 1);
+    let diagnostics = server.await_notification::<PublishDiagnostics>();
+    // Ideally we'd get diagnostics here, but
+    // as of 2026-02-09, we don't.
+    insta::assert_debug_snapshot!(diagnostics);
+
+    // Now write the file to disk, send a CHANGE event
+    // and test that the file is added to ty's state
+    // by asking for diagnostics.
+    server.write_file(foo, foo_content)?;
+    server.change_text_document(foo, vec![], 2);
+    let diagnostics = server.await_notification::<PublishDiagnostics>();
+    insta::assert_debug_snapshot!(diagnostics);
+
+    Ok(())
+}
+
+/// Like `on_did_open_non_existing_file_workspace_with_file_uri`, but uses
+/// a `untitled://...` URL instead of `file://...`.
+///
+/// Notably, this makes diagnostics for opened files that aren't saved to
+/// disk yet work. It's because ty follows the LSP protocol convention that
+/// URIs to files that _don't_ use the `file` scheme refer to documents that
+/// aren't saved to disk yet. So ty correctly detects this as a virtual file
+/// and returns diagnostics for it.
+///
+/// Ref: <https://github.com/astral-sh/ruff/issues/15392>
+/// Ref: <https://github.com/neovim/neovim/issues/21276>
+/// Ref: <https://github.com/microsoft/language-server-protocol/issues/1030>
+#[test]
+fn on_did_open_non_existing_file_workspace_with_untitled_uri() -> Result<()> {
+    let workspace_root = SystemPath::new("src");
+    let foo = SystemPath::new("src/foo.py");
+    let foo_content = "\
+def foo() -> str:
+    return 42
+";
+
+    let mut server = TestServerBuilder::new()?
+        .with_workspace(
+            workspace_root,
+            Some(
+                ClientOptions::default().with_diagnostic_mode(ty_server::DiagnosticMode::Workspace),
+            ),
+        )?
+        .enable_pull_diagnostics(false)
+        .build()
+        .wait_until_workspaces_are_initialized();
+
+    server.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
+        text_document: TextDocumentItem {
+            uri: {
+                let uri = server.file_uri(foo);
+                Url::parse(&format!("untitled://{}", uri.path())).unwrap()
+            },
+            language_id: "python".to_string(),
+            version: 1,
+            text: foo_content.to_string(),
+        },
+    });
+    let diagnostics = server.await_notification::<PublishDiagnostics>();
     insta::assert_debug_snapshot!(diagnostics);
 
     Ok(())
