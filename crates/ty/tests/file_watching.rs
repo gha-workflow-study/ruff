@@ -1531,6 +1531,7 @@ mod unix {
 
         let changes = case.stop_watch(event_for_file("baz.py"));
 
+        dbg!(&changes);
         case.apply_changes(changes, None);
 
         // The file watcher is guaranteed to emit one event for the changed file, but it isn't specified
