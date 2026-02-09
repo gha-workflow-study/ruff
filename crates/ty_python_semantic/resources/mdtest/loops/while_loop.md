@@ -525,5 +525,38 @@ So, because we do monotonic widening in cycle recovery, we need to make sure tha
 types. Instead, `Divergent` should "poison" any value we try to narrow against it, so that our cycle
 recovery logic doesn't carry that result forward.
 
+### `global` and `nonlocal` keywords in a loop
+
+We need to make sure that the loop header definition doesn't count as a "use" prior to the
+`global`/`nonlocal` declaration, or else we'll emit a false-positive semantic syntax error:
+
+```py
+x = 0
+
+def _():
+    y = 0
+    def _():
+        while True:
+            global x
+            nonlocal y
+            x = 42
+            y = 99
+```
+
+On the other hand, we don't want to shadow true positives:
+
+```py
+x = 0
+
+def _():
+    y = 0
+    def _():
+        x = 1
+        y = 1
+        while True:
+            global x  # error: [invalid-syntax] "name `x` is used prior to global declaration"
+            nonlocal y  # error: [invalid-syntax] "name `y` is used prior to nonlocal declaration"
+```
+
 [divergent_debugging]: https://github.com/astral-sh/ruff/pull/22794#issuecomment-3852095578
 [real cases]: https://github.com/Finistere/antidote/blob/7d64ff76b7e283e5d9593ca09ea7a52b9b054957/src/antidote/_internal/localns.py#L34-L35

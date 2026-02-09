@@ -1268,3 +1268,36 @@ for _ in range(1_000_000):
 reveal_type(node)  # revealed: Node
 reveal_type(node.next)  # revealed: Node | None
 ```
+
+### `global` and `nonlocal` keywords in a loop
+
+We need to make sure that the loop header definition doesn't count as a "use" prior to the
+`global`/`nonlocal` declaration, or else we'll emit a false-positive semantic syntax error.
+
+```py
+x = 0
+
+def _():
+    y = 0
+    def _():
+        for _ in range(1_000_000):
+            global x
+            nonlocal y
+            x = 42
+            y = 99
+```
+
+On the other hand, we don't want to shadow true positives:
+
+```py
+x = 0
+
+def _():
+    y = 0
+    def _():
+        x = 1
+        y = 1
+        for _ in range(1_000_000):
+            global x  # error: [invalid-syntax] "name `x` is used prior to global declaration"
+            nonlocal y  # error: [invalid-syntax] "name `y` is used prior to nonlocal declaration"
+```

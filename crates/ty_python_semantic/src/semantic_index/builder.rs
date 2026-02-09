@@ -716,6 +716,7 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
 
         // Note `definition_node` is guaranteed to be a child of `self.module`
         let kind = definition_node.into_owned(self.module);
+        let is_loop_header = kind.is_loop_header();
 
         let category = kind.category(self.source_type.is_stub(), self.module);
         let is_reexported = kind.is_reexported();
@@ -735,7 +736,15 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             definitions.len()
         };
 
-        if category.is_binding() {
+        // We need to avoid marking places as bound as soon as we encounter a loop header
+        // definition for them, because that would lead to false-positive semantic syntax errors in
+        // cases like this:
+        // ```py
+        // while True:
+        //     global x  # [invalid-syntax] if `x` is already used or bound
+        //     x = 1
+        // ```
+        if category.is_binding() && !is_loop_header {
             self.mark_place_bound(place);
         }
         if category.is_declaration() {
