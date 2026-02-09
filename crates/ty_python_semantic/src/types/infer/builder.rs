@@ -155,6 +155,26 @@ struct TypeAndRange<'db> {
     range: TextRange,
 }
 
+/// Whether a dynamic class is being created via `type()` or `types.new_class()`.
+///
+/// This is used by [`TypeInferenceBuilder::extract_dynamic_type_bases`] to adjust
+/// validation and error messages. For example, `types.new_class()` properly handles
+/// metaclasses, so enum bases are allowed (unlike `type()`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DynamicClassKind {
+    TypeCall,
+    NewClass,
+}
+
+impl DynamicClassKind {
+    const fn function_name(self) -> &'static str {
+        match self {
+            Self::TypeCall => "type()",
+            Self::NewClass => "types.new_class()",
+        }
+    }
+}
+
 /// A helper to track if we already know that declared and inferred types are the same.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DeclaredAndInferredType<'db> {
@@ -7114,8 +7134,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             ast::name::Name::new_static("<unknown>")
         };
 
-        let (bases, mut disjoint_bases) =
-            self.extract_dynamic_type_bases(bases_arg, bases_type, &name);
+        let (bases, mut disjoint_bases) = self.extract_dynamic_type_bases(
+            bases_arg,
+            bases_type,
+            &name,
+            DynamicClassKind::TypeCall,
+        );
 
         let scope = self.scope();
 
@@ -7298,7 +7322,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     self.infer_expression(&keyword.value, TypeContext::default());
                 }
             }
-            self.extract_dynamic_type_bases(second_arg, bases_type, &name)
+            self.extract_dynamic_type_bases(
+                second_arg,
+                bases_type,
+                &name,
+                DynamicClassKind::NewClass,
+            )
         } else if let Some(bases_kw) = keywords
             .iter()
             .find(|kw| kw.arg.as_deref() == Some("bases"))
@@ -7317,7 +7346,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             } else {
                 self.infer_expression(&bases_kw.value, TypeContext::default())
             };
-            self.extract_dynamic_type_bases(&bases_kw.value, bases_type, &name)
+            self.extract_dynamic_type_bases(
+                &bases_kw.value,
+                bases_type,
+                &name,
+                DynamicClassKind::NewClass,
+            )
         } else {
             // No bases argument provided, infer remaining args/keywords.
             for arg in args.iter().skip(1) {
@@ -8156,7 +8190,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
     }
 
-    /// Extract base classes from the second argument of a `type()` call.
+    /// Extract base classes from the bases argument of a `type()` or `types.new_class()` call.
     ///
     /// Returns the extracted bases and any disjoint bases found (for instance-layout-conflict
     /// checking). If any bases were invalid, diagnostics are emitted and the dynamic class is
@@ -8166,6 +8200,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         bases_node: &ast::Expr,
         bases_type: Type<'db>,
         name: &ast::name::Name,
+        kind: DynamicClassKind,
     ) -> (Box<[ClassBase<'db>]>, IncompatibleBases<'db>) {
         let db = self.db();
 
@@ -8199,9 +8234,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             ClassBase::try_from_type(db, *base, placeholder_class)
                         {
                             // Check for special bases that are not allowed for dynamic classes.
-                            // Dynamic classes can't be generic, protocols, TypedDicts, or enums.
+                            //
+                            // `type()` doesn't support `__mro_entries__`, so Generic and
+                            // TypedDict bases are invalid. `types.new_class()` handles
+                            // `__mro_entries__` properly, so these are allowed.
+                            //
+                            // Protocol works with both, but ty can't yet represent a
+                            // dynamically-created protocol class, so we emit a warning.
+                            let fn_name = kind.function_name();
                             match class_base {
-                                ClassBase::Generic | ClassBase::TypedDict => {
+                                ClassBase::Generic | ClassBase::TypedDict
+                                    if kind == DynamicClassKind::TypeCall =>
+                                {
                                     if let Some(builder) =
                                         self.context.report_lint(&INVALID_BASE, diagnostic_node)
                                     {
@@ -8234,21 +8278,26 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                     }
                                     return ClassBase::unknown();
                                 }
+                                ClassBase::Generic | ClassBase::TypedDict => {
+                                    // types.new_class() handles __mro_entries__, so these
+                                    // are valid at runtime. Return the base as-is.
+                                    return class_base;
+                                }
                                 ClassBase::Protocol => {
                                     if let Some(builder) = self
                                         .context
                                         .report_lint(&UNSUPPORTED_DYNAMIC_BASE, diagnostic_node)
                                     {
                                         let mut diagnostic = builder.into_diagnostic(
-                                            "Unsupported base for class created via `type()`",
+                                            format_args!("Unsupported base for class created via `{fn_name}`"),
                                         );
                                         diagnostic.set_primary_message(format_args!(
                                             "Has type `{}`",
                                             base.display(db)
                                         ));
-                                        diagnostic.info(
-                                            "Classes created via `type()` cannot be protocols",
-                                        );
+                                        diagnostic.info(format_args!(
+                                            "Classes created via `{fn_name}` cannot be protocols",
+                                        ));
                                         diagnostic.info(format_args!(
                                             "Consider using `class {name}(Protocol): ...` instead"
                                         ));
@@ -8271,30 +8320,34 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                     }
 
                                     // Enum subclasses require the EnumMeta metaclass, which
-                                    // expects special dict attributes that `type()` doesn't provide.
-                                    if let Some((static_class, _)) =
-                                        class_type.static_class_literal(db)
-                                    {
-                                        if is_enum_class_by_inheritance(db, static_class) {
-                                            if let Some(builder) = self
-                                                .context
-                                                .report_lint(&INVALID_BASE, diagnostic_node)
-                                            {
-                                                let mut diagnostic = builder.into_diagnostic(
-                                                    "Invalid base for class created via `type()`",
-                                                );
-                                                diagnostic.set_primary_message(format_args!(
-                                                    "Has type `{}`",
-                                                    base.display(db)
-                                                ));
-                                                diagnostic.info(
-                                                    "Creating an enum class via `type()` is not supported",
-                                                );
-                                                diagnostic.info(format_args!(
-                                                    "Consider using `Enum(\"{name}\", [])` instead"
-                                                ));
+                                    // expects special dict attributes that `type()` doesn't
+                                    // provide. `types.new_class()` handles metaclasses properly,
+                                    // so this restriction only applies to `type()` calls.
+                                    if kind == DynamicClassKind::TypeCall {
+                                        if let Some((static_class, _)) =
+                                            class_type.static_class_literal(db)
+                                        {
+                                            if is_enum_class_by_inheritance(db, static_class) {
+                                                if let Some(builder) = self
+                                                    .context
+                                                    .report_lint(&INVALID_BASE, diagnostic_node)
+                                                {
+                                                    let mut diagnostic = builder.into_diagnostic(
+                                                        "Invalid base for class created via `type()`",
+                                                    );
+                                                    diagnostic.set_primary_message(format_args!(
+                                                        "Has type `{}`",
+                                                        base.display(db)
+                                                    ));
+                                                    diagnostic.info(
+                                                        "Creating an enum class via `type()` is not supported",
+                                                    );
+                                                    diagnostic.info(format_args!(
+                                                        "Consider using `Enum(\"{name}\", [])` instead"
+                                                    ));
+                                                }
+                                                return ClassBase::unknown();
                                             }
-                                            return ClassBase::unknown();
                                         }
                                     }
 
@@ -8310,7 +8363,34 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                                     return class_base;
                                 }
-                                ClassBase::Dynamic(_) => return class_base,
+                                ClassBase::Dynamic(_) => {
+                                    // `type[X]` where X is a concrete class is a valid
+                                    // base, but we can't determine the exact class, so
+                                    // we emit `unsupported-dynamic-base` and use
+                                    // `Unknown`. `type[Any]`/`type[Unknown]` are fine
+                                    // as-is since the dynamic kind propagates.
+                                    if let Type::SubclassOf(s) = base
+                                        && !s.subclass_of().is_dynamic()
+                                        && let Some(builder) = self.context.report_lint(
+                                            &UNSUPPORTED_DYNAMIC_BASE,
+                                            diagnostic_node,
+                                        )
+                                    {
+                                        let mut diagnostic =
+                                            builder.into_diagnostic("Unsupported class base");
+                                        diagnostic.set_primary_message(format_args!(
+                                            "Has type `{}`",
+                                            base.display(db)
+                                        ));
+                                        diagnostic.info(format_args!(
+                                            "ty cannot determine a MRO for class `{name}` due to this base"
+                                        ));
+                                        diagnostic.info(
+                                            "Only class objects or `Any` are supported as class bases",
+                                        );
+                                    }
+                                    return class_base;
+                                }
                             }
                         }
 
@@ -8365,8 +8445,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 ) && let Some(builder) =
                     self.context.report_lint(&INVALID_ARGUMENT_TYPE, bases_node)
                 {
+                    let fn_name = kind.function_name();
                     let mut diagnostic = builder
-                        .into_diagnostic("Invalid argument to parameter 2 (`bases`) of `type()`");
+                        .into_diagnostic(format_args!("Invalid argument to parameter 2 (`bases`) of `{fn_name}`"));
                     diagnostic.set_primary_message(format_args!(
                         "Expected `tuple[type, ...]`, found `{}`",
                         bases_type.display(db)
