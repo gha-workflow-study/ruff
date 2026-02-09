@@ -11739,10 +11739,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         err.return_type()
                     });
 
-                if class.is_known(self.db(), KnownClass::FunctoolsPartial) {
-                    if let Some(partial_ty) = self.infer_functools_partial_call(arguments) {
-                        return partial_ty;
-                    }
+                if class.is_known(self.db(), KnownClass::FunctoolsPartial)
+                    && let Some(partial_ty) = self.infer_functools_partial_call(arguments)
+                {
+                    return partial_ty;
                 }
 
                 return instance_ty;
