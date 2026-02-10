@@ -1197,6 +1197,7 @@ fn place_from_bindings_impl<'db>(
     };
 
     let mut first_definition = None;
+    let mut only_loop_header_bindings = true;
 
     let mut types = bindings_with_constraints.filter_map(
         |BindingWithConstraints {
@@ -1325,6 +1326,8 @@ fn place_from_bindings_impl<'db>(
                 if !has_defined_bindings {
                     return None;
                 }
+            } else {
+                only_loop_header_bindings = false;
             }
 
             first_definition.get_or_insert(binding);
@@ -1351,15 +1354,19 @@ fn place_from_bindings_impl<'db>(
         let boundness = match boundness_analysis {
             BoundnessAnalysis::AssumeBound => Definedness::AlwaysDefined,
             BoundnessAnalysis::BasedOnUnboundVisibility => match unbound_visibility() {
+                Some(Truthiness::AlwaysTrue) if only_loop_header_bindings => {
+                    // Loop header definitions don't shadow prior bindings, so UNBOUND can still be
+                    // definitely-visible alongside a loop header binding. See "Use with loop
+                    // header and also `UNBOUND` definitely visible" in `while_loop.md`.
+                    Definedness::PossiblyUndefined
+                }
+                Some(Truthiness::AlwaysTrue) => {
+                    unreachable!(
+                        "If we have at least one binding, the implicit `unbound` binding should not be definitely visible"
+                    )
+                }
                 Some(Truthiness::AlwaysFalse) | None => Definedness::AlwaysDefined,
                 Some(Truthiness::Ambiguous) => Definedness::PossiblyUndefined,
-                // A place shouldn't be definitely-unbound when there are visible bindings. The
-                // initial UNBOUND definition should either get shadowed by those bindings (if
-                // they're unconditional), or it should have constraints attached to it (if the
-                // other bindings are conditional). However, there's one exception to that
-                // intuitive rule: Loop header definitions don't shadow prior bindings, because
-                // prior bindings are always visible at the start of the first loop iteration.
-                Some(Truthiness::AlwaysTrue) => Definedness::PossiblyUndefined,
             },
         };
 

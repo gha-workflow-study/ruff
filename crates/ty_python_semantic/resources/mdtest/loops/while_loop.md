@@ -558,5 +558,20 @@ def _():
             nonlocal y  # error: [invalid-syntax] "name `y` is used prior to nonlocal declaration"
 ```
 
+### Use with loop header and also `UNBOUND` definitely visible
+
+In `place_from_bindings_impl` we usually assert that if at least one (non-`UNBOUND`) binding is
+visible, then `UNBOUND` should not be definitely-visible. That makes intuitive sense: either a
+binding should shadow `UNBOUND` entirely, or if it was made in a branch then it should attach the
+negated branch condition to `UNBOUND`. However, loop header bindings are an exception to this rule,
+because they don't shadow prior bindings. In this example `UNBOUND` is definitely-visible, and we
+need to avoid panicking:
+
+```py
+while True:
+    x  # error: [possibly-unresolved-reference]
+    x = 1
+```
+
 [divergent_debugging]: https://github.com/astral-sh/ruff/pull/22794#issuecomment-3852095578
 [real cases]: https://github.com/Finistere/antidote/blob/7d64ff76b7e283e5d9593ca09ea7a52b9b054957/src/antidote/_internal/localns.py#L34-L35
